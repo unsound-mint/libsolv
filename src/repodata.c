@@ -60,6 +60,8 @@ repodata_initdata(Repodata *data, Repo *repo, int localpool)
   repopagestore_init(&data->store);
 }
 
+static struct dircache *dircache_free(struct dircache *dircache);
+
 void
 repodata_freedata(Repodata *data)
 {
@@ -96,7 +98,7 @@ repodata_freedata(Repodata *data)
   solv_free(data->attriddata);
   solv_free(data->attrnum64data);
 
-  solv_free(data->dircache);
+  dircache_free(data->dircache);
 
   repodata_free_filelistfilter(data);
 }
@@ -268,6 +270,11 @@ static inline const char *strchrnul(const char *str, char x)
 struct dircache {
   Id ids[DIRCACHE_SIZE];
   char str[(DIRCACHE_SIZE * (DIRCACHE_SIZE - 1)) / 2];
+  /* state of datamatcher_checkdirprefix(), see there */
+  char *prefix;			/* literal prefix of the glob the dirmatch map is valid for */
+  int prefixlen;
+  unsigned char *dirmatch;	/* per dir id: 0 unknown, 1 may match, 2 does not match */
+  Id ndirmatch;
 };
 #endif
 
@@ -347,10 +354,21 @@ repodata_str2dir(Repodata *data, const char *dir, int create)
   return parent;
 }
 
+static struct dircache *
+dircache_free(struct dircache *dircache)
+{
+  if (dircache)
+    {
+      solv_free(dircache->prefix);
+      solv_free(dircache->dirmatch);
+    }
+  return solv_free(dircache);
+}
+
 void
 repodata_free_dircache(Repodata *data)
 {
-  data->dircache = solv_free(data->dircache);
+  data->dircache = dircache_free(data->dircache);
 }
 
 const char *
@@ -1481,6 +1499,85 @@ datamatcher_match(Datamatcher *ma, const char *str)
     }
 }
 
+/* Check if a file in directory "did" can possibly match the glob in "ma", looking only at the literal
+ * prefix of the glob (the part before the first special character) and the directory. This lets us skip
+ * all files of a non-matching directory without having to build their full path first.
+ * The result is remembered per directory id, so every directory is only looked at once per prefix. */
+#define DIRPREFIX_MAXDEPTH 32
+
+static int
+datamatcher_checkdirprefix(Datamatcher *ma, Repodata *data, Id did)
+{
+  const char *match = ma->match;
+  const char *comps[DIRPREFIX_MAXDEPTH];
+  Pool *pool;
+  Stringpool *ss;
+  struct dircache *dc;
+  int depth = 0, n, pos = 0, i;
+  Id parent;
+
+  if (!did || !match || (ma->flags & SEARCH_NOCASE) != 0)
+    return 1;
+  if (!(dc = data->dircache))
+    dc = data->dircache = solv_calloc(1, sizeof(struct dircache));
+  if (!dc)
+    return 1;
+  /* is the cached prefix still the literal prefix of the glob? */
+  n = dc->prefixlen;
+  if (!dc->prefix || strncmp(dc->prefix, match, n) != 0 || (match[n] && match[n] != '*' && match[n] != '?' && match[n] != '[' && match[n] != '\\'))
+    {
+      for (n = 0; match[n]; n++)
+	if (match[n] == '*' || match[n] == '?' || match[n] == '[' || match[n] == '\\')
+	  break;
+      solv_free(dc->prefix);
+      dc->prefix = solv_malloc(n + 1);
+      memcpy(dc->prefix, match, n);
+      dc->prefix[n] = 0;
+      dc->prefixlen = n;
+      if (dc->dirmatch)
+	memset(dc->dirmatch, 0, dc->ndirmatch);
+    }
+  if (!n)
+    return 1;
+  if (did >= dc->ndirmatch)
+    {
+      Id nn = data->dirpool.ndirs > did ? data->dirpool.ndirs : did + 1;
+      dc->dirmatch = solv_realloc2(dc->dirmatch, nn, 1);
+      memset(dc->dirmatch + dc->ndirmatch, 0, nn - dc->ndirmatch);
+      dc->ndirmatch = nn;
+    }
+  if (dc->dirmatch[did])
+    return dc->dirmatch[did] == 1;
+
+  pool = data->repo->pool;
+  ss = data->localpool ? &data->spool : &pool->ss;
+  for (parent = did; parent; parent = dirpool_parent(&data->dirpool, parent))
+    {
+      if (depth == DIRPREFIX_MAXDEPTH)
+	return 1;
+      comps[depth++] = stringpool_id2str(ss, dirpool_compid(&data->dirpool, parent));
+    }
+  /* the full path is comps[depth - 1] "/" ... "/" comps[0] "/" basename */
+  dc->dirmatch[did] = 1;
+  for (i = depth - 1; i >= 0; i--)
+    {
+      size_t l = strlen(comps[i]);
+      size_t k = n - pos < (int)l ? n - pos : l;
+      if (memcmp(comps[i], dc->prefix + pos, k) != 0)
+	break;
+      pos += k;
+      if (pos >= n)
+	return 1;
+      if (dc->prefix[pos] != '/')
+	break;
+      if (++pos >= n)
+	return 1;
+    }
+  if (i >= 0)
+    dc->dirmatch[did] = 2;
+  return dc->dirmatch[did] == 1;
+}
+
 /* check if the matcher can match the provides basename */
 
 int
@@ -1977,6 +2074,9 @@ dataiterator_step(Dataiterator *di)
 	  /* simple pre-check so that we don't need to stringify */
 	  if (di->keyname == SOLVABLE_FILELIST && di->key->type == REPOKEY_TYPE_DIRSTRARRAY && (di->matcher.flags & SEARCH_FILES) != 0)
 	    if (!datamatcher_checkbasename(&di->matcher, di->kv.str))
+	      continue;
+	  if (di->keyname == SOLVABLE_FILELIST && di->key->type == REPOKEY_TYPE_DIRSTRARRAY && (di->matcher.flags & SEARCH_FILES) != 0 && (di->matcher.flags & SEARCH_STRINGMASK) == SEARCH_GLOB)
+	    if (!datamatcher_checkdirprefix(&di->matcher, di->data, di->kv.id))
 	      continue;
 	  /* now stringify so that we can do the matching */
 	  if (!(str = repodata_stringify(di->pool, di->data, di->key, &di->kv, di->flags)))
